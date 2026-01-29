@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IR Bridge Extension</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+
+import React, { useState, useEffect, useRef } from 'react';
+
+/**
+ * EXTENSION MANIFEST (For Reference):
+ * {
+ * "name": "IR Physical Mini Bridge",
+ * "id": "com.yourname.ir-bridge",
+ * "version": "1.1.1",
+ * "target": ["TABLETOP"],
+ * "background": "index.html"
+ * }
+ */
+
+const App = () => {
+  const [ready, setReady] = useState(false);
+  const [isTableMode, setIsTableMode] = useState(false);
+  const [status, setStatus] = useState("Initializing...");
+  const [selectionCount, setSelectionCount] = useState(0);
+  
+  // High-performance state tracking
+  const activeSyncs = useRef(new Map()); // Map<PointerID, {tokenId, startX, startY, isMoving}>
+  const ghostToken = useRef(null); // {tokenId, expiry}
+  const JITTER_THRESHOLD = 8; // Pixels to move before kinetic binding triggers
+  const GHOST_DURATION = 10000; // 10 seconds to move a mini
+
+  useEffect(() => {
+    // Accessing OBR from global scope as per extension environment
+    if (typeof window.OBR !== 'undefined') {
+      window.OBR.onReady(() => {
+        setReady(true);
+        setStatus("Ready for Physical Minis");
+        
+        // Track selection to update UI buttons
+        window.OBR.player.onChange((player) => {
+          setSelectionCount(player.selection?.length || 0);
+        });
+      });
+    }
+  }, []);
+
+  // 1. Kinetic & Center-Point Logic
+  const handlePointerDown = async (e) => {
+    if (!isTableMode || !ready) return;
+    const { clientX, clientY, pointerId } = e;
+    const scenePos = await window.OBR.viewport.screenToTransformed(clientX, clientY);
+
+    // GHOST RECOVERY
+    if (ghostToken.current && Date.now() < ghostToken.current.expiry) {
+      const tokenId = ghostToken.current.tokenId;
+      await moveTokenToCenter(tokenId, scenePos);
+      
+      activeSyncs.current.set(pointerId, { 
+        tokenId, 
+        startX: scenePos.x, 
+        startY: scenePos.y, 
+        isMoving: true // Instant bind for ghost recovery
+      });
+      
+      ghostToken.current = null;
+      setStatus("Ghost Recovered");
+      return;
+    }
+
+    // NEW SYNC ATTEMPT
+    const items = await window.OBR.scene.items.getItems((item) => item.type === "IMAGE" && item.metadata["ir-physical"] === true);
+    
+    // Find closest physical-enabled token center
+    const hit = items
+      .filter(item => {
+        const width = item.image.width * item.scale.x;
+        const height = item.image.height * item.scale.y;
+        
+        // Check if touch is within the token bounds
+        return (
+          scenePos.x >= item.position.x &&
+          scenePos.x <= item.position.x + width &&
+          scenePos.y >= item.position.y &&
+          scenePos.y <= item.position.y + height
+        );
+      })
+      .sort((a, b) => b.zIndex - a.zIndex)[0];
+
+    if (hit) {
+      activeSyncs.current.set(pointerId, {
+        tokenId: hit.id,
+        startX: scenePos.x,
+        startY: scenePos.y,
+        isMoving: false // Wait for kinetic movement
+      });
+      setStatus("Monitoring Mini...");
+    }
+  };
+
+  const handlePointerMove = async (e) => {
+    if (!isTableMode || !ready) return;
+    const sync = activeSyncs.current.get(e.pointerId);
+    if (!sync) return;
+
+    const scenePos = await window.OBR.viewport.screenToTransformed(e.clientX, e.clientY);
+
+    // Kinetic Check: Don't move until we pass the jitter threshold
+    if (!sync.isMoving) {
+      const dist = Math.sqrt(
+        Math.pow(scenePos.x - sync.startX, 2) + 
+        Math.pow(scenePos.y - sync.startY, 2)
+      );
+      
+      if (dist > JITTER_THRESHOLD) {
+        sync.isMoving = true;
+        // Visual Feedback: Sink the token
+        await window.OBR.scene.items.updateItems([sync.tokenId], (items) => {
+          items[0].scale = { x: items[0].scale.x * 0.9, y: items[0].scale.y * 0.9 };
+        });
+        setStatus("Mini Moving");
+      } else {
+        return; // Still stationary
+      }
+    }
+
+    await moveTokenToCenter(sync.tokenId, scenePos);
+  };
+
+  const handlePointerUp = async (e) => {
+    if (!isTableMode || !ready) return;
+    const sync = activeSyncs.current.get(e.pointerId);
+    
+    if (sync) {
+      if (sync.isMoving) {
+        ghostToken.current = {
+          tokenId: sync.tokenId,
+          expiry: Date.now() + GHOST_DURATION
+        };
+        
+        // Un-sink visual
+        await window.OBR.scene.items.updateItems([sync.tokenId], (items) => {
+          items[0].scale = { x: items[0].scale.x / 0.9, y: items[0].scale.y / 0.9 };
+        });
+        setStatus("Mini Lifted (Ghost Active)");
+      } else {
+        setStatus("Handshake Cancelled (No Move)");
+      }
+      activeSyncs.current.delete(e.pointerId);
+    }
+  };
+
+  const moveTokenToCenter = async (id, pos) => {
+    await window.OBR.scene.items.updateItems([id], (items) => {
+      const item = items[0];
+      if (!item) return;
+      const width = item.image.width * item.scale.x;
+      const height = item.image.height * item.scale.y;
+      item.position = {
+        x: pos.x - width / 2,
+        y: pos.y - height / 2
+      };
+    });
+  };
+
+  // 2. DM / UI Tools
+  const togglePhysicalLink = async () => {
+    const selected = await window.OBR.player.getSelection();
+    if (!selected?.length) return;
+
+    await window.OBR.scene.items.updateItems(selected, (items) => {
+      for (let item of items) {
+        const isLinked = item.metadata["ir-physical"];
+        item.metadata["ir-physical"] = !isLinked;
+        // Visual indicator: Green border for physical tokens
+        item.strokeColor = !isLinked ? "#10b981" : undefined;
+        item.strokeWidth = !isLinked ? 5 : 0;
+      }
+    });
+    setStatus(`Updated ${selected.length} tokens`);
+  };
+
+  return (
+    <div className="p-4 bg-slate-900 text-white min-h-screen font-sans flex flex-col gap-4 select-none">
+      <header className="border-b border-slate-700 pb-2">
+        <div className="flex justify-between items-center">
+          <h1 className="text-xl font-bold text-amber-500">IR Bridge v1.1.1</h1>
+          <div className={`w-3 h-3 rounded-full ${isTableMode ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+        </div>
+        <p className="text-[10px] text-slate-400 uppercase tracking-widest">Physical Miniature Interface</p>
+      </header>
+
+      <div 
+        className="flex-1 border-2 border-dashed border-slate-700 rounded-xl flex flex-col items-center justify-center p-6 text-center transition-colors"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        style={{ touchAction: 'none' }}
+      >
+        <p className="text-sm text-slate-400 mb-2">Current Status:</p>
+        <p className="text-lg font-medium text-amber-200 h-12 flex items-center">{status}</p>
+        
+        <button 
+          onClick={() => setIsTableMode(!isTableMode)}
+          className={`mt-6 w-full py-4 rounded-lg font-bold shadow-lg transition-all active:scale-95 ${
+            isTableMode ? 'bg-red-900/40 text-red-200 border border-red-700' : 'bg-amber-600 text-white hover:bg-amber-500'
+          }`}
+        >
+          {isTableMode ? 'STOP IR TRACKING' : 'START IR TRACKING'}
+        </button>
+      </div>
+
+      <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col gap-3">
+        <div className="flex justify-between items-center">
+          <span className="text-xs font-bold text-slate-400">SELECTION TOOLS</span>
+          <span className="text-[10px] bg-slate-700 px-2 py-0.5 rounded">{selectionCount} Selected</span>
+        </div>
+        
+        <button 
+          onClick={togglePhysicalLink}
+          disabled={selectionCount === 0}
+          className={`py-2 rounded text-sm font-semibold border transition-all ${
+            selectionCount > 0 
+            ? 'bg-emerald-600 border-emerald-500 hover:bg-emerald-500' 
+            : 'bg-slate-700 border-slate-600 opacity-50 cursor-not-allowed'
+          }`}
+        >
+          Link/Unlink Physical Mini
+        </button>
+        
+        <p className="text-[10px] text-slate-500 italic text-center">
+          Linked tokens get a green border and react to IR touches.
+        </p>
+      </div>
+
+      <footer className="text-[10px] text-slate-600 text-center space-y-1">
+        <p>Kinetic Threshold: 8px | Ghost Window: 10s</p>
+        <p>© Tabletop IR Bridge</p>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
+
+    </script>
+</body>
+</html>
